@@ -76,9 +76,21 @@ jobs:
             SDKMGR="$SDK/cmdline-tools/latest/bin/sdkmanager"
           fi
           echo "using $SDKMGR"
-          yes | "$SDKMGR" --sdk_root="$SDK" --licenses > /dev/null || true
-          yes | "$SDKMGR" --sdk_root="$SDK" --install "ndk;${{ inputs.ndk_version }}" > /tmp/ndk-install.log 2>&1 || { tail -40 /tmp/ndk-install.log; exit 1; }
-          test -d "$SDK/ndk/${{ inputs.ndk_version }}" || { echo "NDK dir missing"; exit 1; }
+
+          # Accept licenses. `yes | sdkmanager` dies with SIGPIPE ("yes: standard output:
+          # Broken pipe") once sdkmanager exits, and under `set -e`/pipefail that aborts
+          # the job. Feed a finite list instead and tolerate the exit code.
+          printf 'y\n%.0s' $(seq 1 200) > /tmp/lic.txt
+          "$SDKMGR" --sdk_root="$SDK" --licenses < /tmp/lic.txt > /tmp/lic.log 2>&1 || true
+          tail -3 /tmp/lic.log || true
+
+          # Install the NDK. Same reasoning: feed stdin, and only trust the resulting dir.
+          "$SDKMGR" --sdk_root="$SDK" --install "ndk;${{ inputs.ndk_version }}" < /tmp/lic.txt > /tmp/ndk-install.log 2>&1 || true
+          if [ ! -d "$SDK/ndk/${{ inputs.ndk_version }}" ]; then
+            echo "NDK install failed; tail of log:"
+            tail -60 /tmp/ndk-install.log
+            exit 1
+          fi
           echo "NDK_ROOT=$SDK/ndk/${{ inputs.ndk_version }}" >> "$GITHUB_ENV"
           cat "$SDK/ndk/${{ inputs.ndk_version }}/source.properties"
 
