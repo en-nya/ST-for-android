@@ -1,0 +1,3 @@
+# P1 patch targets JS sources that upstream ships with LF.
+# Do not let autocrlf rewrite line endings on apply; the vetted artifact is LF.
+*.js text eol=lf

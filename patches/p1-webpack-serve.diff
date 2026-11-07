@@ -1,0 +1,333 @@
+diff --git a/src/middleware/webpack-serve.js b/src/middleware/webpack-serve.js
+index f028573..7fcf280 100644
+--- a/src/middleware/webpack-serve.js
++++ b/src/middleware/webpack-serve.js
+@@ -1,8 +1,208 @@
+ import path from 'node:path';
+-import webpack from 'webpack';
+-import getPublicLibConfig from '../../webpack.config.js';
++import fs from 'node:fs';
++import crypto from 'node:crypto';
++
++/**
++ * [ANDROID-PORT PATCH P1 v3] Boot-time webpack compile removed.
++ *
++ * Upstream imports `webpack` and `../../webpack.config.js` at module load time, and that
++ * config module does a top-level `await getVersion()` (which shells out to `git`), then
++ * `preSetupTasks()` runs a full production webpack compile before `listen`. On the
++ * reference desktop that is ~13s of compiler CPU per boot; on a phone it is minutes.
++ *
++ * The very same artifact is produced once at package time by `docker/build-lib.js`
++ * (`runWebpackCompiler({ forceDist: true })`) and shipped as
++ *   dist/_webpack/<cacheVersion>/output/lib.js
++ * so at runtime we only need to *locate* that file and serve it.
++ *
++ * ── Why v3 (read this before "simplifying" it back) ──────────────────────────────
++ * v1 picked the newest mtime. DEMONSTRATED BUG: a stale/partial cache dir with a newer
++ * mtime won and was served as a truncated 4,096-byte lib.js with HTTP 200 — a blank UI
++ * that logs success. Silent-wrong, the worst possible failure mode.
++ *
++ * v2 replaced that with content heuristics (min size + webpack banner + `export{` tail).
++ * ADVERSARIAL TESTING BROKE IT BOTH WAYS:
++ *   - FALSE ACCEPT: a 300 KB stub consisting of a valid banner + padding + `export{a as b};`
++ *     passed every check.
++ *   - FALSE REJECT: a legitimate bundle with `export {` (space) failed; a legitimate
++ *     bundle with a sourcemap comment pushing the export >4 KB from EOF failed; a
++ *     legitimately small (205 KB) bundle failed the size floor.
++ * Content sniffing cannot distinguish "real bundle" from "bytes that look like one",
++ * and it hard-codes one bundler's exact output shape.
++ *
++ * v3 therefore does NOT sniff content. Selection is a pure identity check:
++ *   - `dist/_webpack/BUILD.json` is the single source of truth, written by the SAME
++ *     build step that emits the artifact.
++ *   - It records `cacheVersion`, `filename`, `bytes` and a **sha256**.
++ *   - The runtime resolves exactly that path and verifies size + sha256.
++ *     Mismatch -> throw. No manifest -> throw. No scanning, no mtime, no guessing.
++ *
++ * This is deterministic, cannot be fooled by a plausible-looking file, has no false
++ * rejects for legitimately different bundles, and fails LOUDLY rather than serving junk.
++ * If a future build changes the bundle shape, nothing here needs to change — only the
++ * manifest, which is generated automatically.
++ */
++
++/** Name of the build manifest, written next to the cache directories. */
++const MANIFEST_NAME = 'BUILD.json';
+ 
+ export default function getWebpackServeMiddleware() {
++    /**
++     * Resolved + verified prebuilt artifact, set by usePrebuiltLib().
++     * @type {{ outputPath: string, outputFile: string, size: number } | null}
++     */
++    let prebuilt = null;
++
++    /**
++     * Read and parse the build manifest.
++     *
++     * @param {string} distRoot
++     * @returns {{ cacheVersion?: string, filename?: string, bytes?: number, sha256?: string } | null}
++     */
++    function readBuildManifest(distRoot) {
++        const manifestPath = path.join(distRoot, MANIFEST_NAME);
++        try {
++            const raw = fs.readFileSync(manifestPath, 'utf8');
++            // Strip a UTF-8 BOM. Build/CI tooling on Windows emits one and JSON.parse
++            // rejects it — verified: JSON.parse throws "Unexpected token '\uFEFF'".
++            return JSON.parse(String(raw).replace(/^\uFEFF/, ''));
++        } catch (err) {
++            if (err?.code === 'ENOENT') {
++                return null;
++            }
++            throw new Error(
++                `[P1] ${manifestPath} exists but could not be parsed: ${err.message}. ` +
++                'Regenerate it with `node ./docker/build-lib.js`.',
++            );
++        }
++    }
++
++    /**
++     * Verify a candidate against the manifest's recorded identity.
++     *
++     * @param {string} libPath
++     * @param {{ bytes?: number, sha256?: string }} manifest
++     * @returns {{ ok: true } | { ok: false, reason: string }}
++     */
++    function verify(libPath, manifest) {
++        let stat;
++        try {
++            stat = fs.statSync(libPath);
++        } catch (err) {
++            return { ok: false, reason: `cannot stat: ${err.code ?? err.message}` };
++        }
++
++        if (!stat.isFile()) {
++            return { ok: false, reason: 'not a regular file' };
++        }
++
++        if (typeof manifest.bytes === 'number' && manifest.bytes >= 0 && stat.size !== manifest.bytes) {
++            return { ok: false, reason: `size mismatch: on disk ${stat.size} B, manifest says ${manifest.bytes} B` };
++        }
++
++        if (stat.size === 0) {
++            return { ok: false, reason: 'empty file' };
++        }
++
++        if (typeof manifest.sha256 === 'string' && manifest.sha256) {
++            let digest;
++            try {
++                digest = crypto.createHash('sha256').update(fs.readFileSync(libPath)).digest('hex');
++            } catch (err) {
++                return { ok: false, reason: `cannot hash: ${err.code ?? err.message}` };
++            }
++            if (digest !== manifest.sha256.toLowerCase()) {
++                return { ok: false, reason: `sha256 mismatch: on disk ${digest}, manifest ${manifest.sha256}` };
++            }
++        } else {
++            // A manifest with no hash can only be size-checked, which is strictly weaker.
++            // Still better than guessing, but say so loudly rather than silently trusting.
++            console.warn(
++                `[P1] WARNING: ${MANIFEST_NAME} has no sha256; ${libPath} was verified by size only. ` +
++                'Regenerate the manifest with a current `docker/build-lib.js` to get integrity checking.',
++            );
++        }
++
++        return { ok: true };
++    }
++
++    /**
++     * Locate and verify the prebuilt lib.js described by dist/_webpack/BUILD.json.
++     *
++     * @param {string} [distRoot] Override for the dist root (defaults to <cwd>/dist/_webpack).
++     * @returns {{ outputPath: string, outputFile: string, size: number }}
++     * @throws {Error} If the manifest is missing, or the described artifact is absent/altered.
++     */
++    devMiddleware.usePrebuiltLib = (distRoot = path.resolve(process.cwd(), 'dist', '_webpack')) => {
++        const manifest = readBuildManifest(distRoot);
++
++        if (!manifest) {
++            throw new Error(
++                `[P1] No ${MANIFEST_NAME} under ${distRoot}. The packaging step must run ` +
++                '`node ./docker/build-lib.js`, which compiles dist/_webpack/<hash>/output/lib.js ' +
++                'and writes the manifest describing it. Refusing to guess which file to serve ' +
++                '(note: upstream .gitignore and .dockerignore both contain /dist — the packaging ' +
++                'step must un-ignore it).',
++            );
++        }
++
++        const cacheVersion = typeof manifest.cacheVersion === 'string' ? manifest.cacheVersion.trim() : '';
++        const outputFile = typeof manifest.filename === 'string' && manifest.filename
++            ? manifest.filename
++            : 'lib.js';
++
++        if (!cacheVersion) {
++            throw new Error(
++                `[P1] ${MANIFEST_NAME} under ${distRoot} has no "cacheVersion". ` +
++                'Regenerate it with `node ./docker/build-lib.js`.',
++            );
++        }
++
++        // Reject a cacheVersion that would escape the dist root (defence in depth: the
++        // manifest is build output, but it is read from a writable install tree).
++        if (cacheVersion.includes('..') || cacheVersion.includes('/') || cacheVersion.includes('\\')) {
++            throw new Error(`[P1] ${MANIFEST_NAME} has an unsafe cacheVersion: ${JSON.stringify(cacheVersion)}.`);
++        }
++
++        // Same check for `filename`. Without it, a crafted manifest could point at any file
++        // on the device (e.g. "../../../README.md"). The ENOENT on a missing target would
++        // accidentally save us — that is not a defence, it is luck. Validate structurally.
++        if (outputFile.includes('..') || outputFile.includes('/') || outputFile.includes('\\')) {
++            throw new Error(`[P1] ${MANIFEST_NAME} has an unsafe filename: ${JSON.stringify(outputFile)}.`);
++        }
++
++        const outputPath = path.join(distRoot, cacheVersion, 'output');
++        const libPath = path.join(outputPath, outputFile);
++
++        // Belt and braces: the resolved path must still be inside outputPath.
++        const resolvedOutput = path.resolve(outputPath);
++        const resolvedLib = path.resolve(libPath);
++        if (resolvedLib !== path.join(resolvedOutput, outputFile) || !resolvedLib.startsWith(resolvedOutput + path.sep)) {
++            throw new Error(
++                `[P1] Resolved prebuilt path escapes its cache directory: ${resolvedLib} (expected under ${resolvedOutput}).`,
++            );
++        }
++
++        const result = verify(libPath, manifest);
++        if (!result.ok) {
++            throw new Error(
++                `[P1] Prebuilt frontend library described by ${MANIFEST_NAME} is not usable: ` +
++                `${result.reason} (${libPath}). Refusing to serve an unverified bundle; ` +
++                'rerun `node ./docker/build-lib.js`.',
++            );
++        }
++
++        const size = fs.statSync(libPath).size;
++        prebuilt = { outputPath, outputFile, size };
++
++        console.log(
++            `Serving prebuilt frontend library: ${libPath} ` +
++            `(${(size / 1024 / 1024).toFixed(2)} MiB, sha256-verified)`,
++        );
++
++        return prebuilt;
++    };
++
+     /**
+      * A very spartan recreation of webpack-dev-middleware.
+      * @param {import('express').Request} req Request object.
+@@ -11,40 +211,100 @@ export default function getWebpackServeMiddleware() {
+      * @type {import('express').RequestHandler}
+      */
+     function devMiddleware(req, res, next) {
+-        const publicLibConfig = getPublicLibConfig();
+-        const outputPath = publicLibConfig.output?.path;
+-        const outputFile = publicLibConfig.output?.filename;
+-        const parsedPath = path.parse(req.path);
+-
+-        if (req.method === 'GET' && parsedPath.dir === '/' && parsedPath.base === outputFile) {
+-            return res.sendFile(outputFile, { root: outputPath });
++        // Only ever serve the file resolved (and verified) at boot. If usePrebuiltLib()
++        // was never called — i.e. this is a plain source checkout — fall through to
++        // express.static, which is upstream's own behaviour.
++        if (prebuilt) {
++            const parsedPath = path.parse(req.path);
++            if (req.method === 'GET' && parsedPath.dir === '/' && parsedPath.base === prebuilt.outputFile) {
++                return res.sendFile(prebuilt.outputFile, { root: prebuilt.outputPath });
++            }
+         }
+-
+         next();
+     }
+ 
+     /**
+-     * Wait until Webpack is done compiling.
++     * Compile the frontend library and write the manifest that usePrebuiltLib() consumes.
++     *
++     * [P1] `webpack` and the config module are imported lazily so the runtime boot path
++     * never pays for them. Called by `docker/build-lib.js` at package time.
++     *
+      * @param {object} param Parameters.
+      * @param {boolean} [param.forceDist=false] Whether to force the use the /dist folder.
+      * @param {boolean} [param.pruneCache=false] Whether to prune old cache directories before compiling.
+      * @returns {Promise<void>}
+      */
+-    devMiddleware.runWebpackCompiler = ({ forceDist = false, pruneCache = false } = {}) => {
++    devMiddleware.runWebpackCompiler = async ({ forceDist = false, pruneCache = false } = {}) => {
+         console.log();
+         console.log('Compiling frontend libraries...');
+ 
++        const [{ default: webpack }, { default: getPublicLibConfig }] = await Promise.all([
++            import('webpack'),
++            import('../../webpack.config.js'),
++        ]);
++
+         const publicLibConfig = getPublicLibConfig({ forceDist, pruneCache });
+         const compiler = webpack(publicLibConfig);
+ 
+-        return new Promise((resolve) => {
+-            compiler.run((_error, stats) => {
+-                const output = stats?.toString(publicLibConfig.stats);
+-                if (output) {
+-                    console.log(output);
+-                    console.log();
+-                }
++        return new Promise((resolve, reject) => {
++            compiler.run((error, stats) => {
+                 compiler.close(() => {
++                    // [P1] Upstream swallowed this (`(_error, stats)`, error never inspected),
++                    // which let a failed compile still "succeed" and serve a blank UI.
++                    if (error) {
++                        reject(new Error(`[P1] Frontend library compilation failed: ${error.message}`));
++                        return;
++                    }
++                    if (stats?.hasErrors?.()) {
++                        const info = stats.toJson({ errors: true });
++                        reject(new Error(
++                            '[P1] Frontend library compilation finished with errors:\n' +
++                            (info.errors || []).map(e => `  - ${e.message ?? e}`).join('\n'),
++                        ));
++                        return;
++                    }
++
++                    const output = stats?.toString(publicLibConfig.stats);
++                    if (output) {
++                        console.log(output);
++                        console.log();
++                    }
++
++                    try {
++                        const outputPath = publicLibConfig.output?.path;
++                        const outputFilename = publicLibConfig.output?.filename;
++                        if (!outputPath || !outputFilename) {
++                            console.warn('[P1] Webpack config has no output path/filename; skipping manifest.');
++                            resolve();
++                            return;
++                        }
++
++                        const libPath = path.join(outputPath, outputFilename);
++                        // outputPath is <distRoot>/<cacheVersion>/output
++                        const cacheVersion = path.basename(path.dirname(outputPath));
++                        const distRoot = path.dirname(path.dirname(outputPath));
++
++                        const bytes = fs.statSync(libPath).size;
++                        const sha256 = crypto.createHash('sha256')
++                            .update(fs.readFileSync(libPath))
++                            .digest('hex');
++
++                        fs.mkdirSync(distRoot, { recursive: true });
++                        fs.writeFileSync(
++                            path.join(distRoot, MANIFEST_NAME),
++                            JSON.stringify(
++                                { cacheVersion, filename: outputFilename, bytes, sha256, builtAt: new Date().toISOString() },
++                                null, 2,
++                            ),
++                        );
++                        console.log(
++                            `Wrote prebuilt manifest: ${path.join(distRoot, MANIFEST_NAME)} ` +
++                            `(${cacheVersion}, ${bytes} B, sha256 ${sha256.slice(0, 12)}…)`,
++                        );
++                    } catch (e) {
++                        console.warn(`[P1] Could not write ${MANIFEST_NAME}: ${e.message}`);
++                    }
++
+                     resolve();
+                 });
+             });

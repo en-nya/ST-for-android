@@ -1,0 +1,192 @@
+name: build-android-node
+
+# Build a stock Node.js LTS as an Android arm64 EXECUTABLE.
+#
+# Why this exists (see docs/02-sds.md):
+#   * Node's Android cross-compile is Linux-only (android_configure.py exits 1 elsewhere),
+#     and this machine has no WSL and no admin rights -> build on a Linux runner.
+#   * We deliberately do NOT pass --shared. configure.py's --shared default is None,
+#     so the default output is an executable. A .so cannot be execve'd from an APK
+#     (fogtape/nodejs-mobile artifacts are ET_DYN with e_entry=0x0 -> ENOEXEC).
+#   * full-icu is the default, and is REQUIRED: src/users.js:645 calls
+#     String.prototype.normalize() on the login path; an intl=none build cannot log in.
+#   * 16 KB page alignment comes from NDK r28+ linker defaults, NOT from LDFLAGS
+#     (configure.py has no --ldflags option and never reads $LDFLAGS - verified).
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node version to build (LTS)'
+        required: false
+        default: '24.22.2'
+      ndk_version:
+        description: 'NDK version (r28+ for 16KB defaults)'
+        required: false
+        default: '28.2.13676358'
+      arch:
+        description: 'Target arch'
+        required: false
+        default: 'arm64'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ['arm64']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK + NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK ${{ inputs.ndk_version }}
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --install "ndk;${{ inputs.ndk_version }}" > /dev/null
+          echo "NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${{ inputs.ndk_version }}" >> "$GITHUB_ENV"
+          "$ANDROID_SDK_ROOT/ndk/${{ inputs.ndk_version }}/source.properties" | tail -5 || true
+          cat "$ANDROID_SDK_ROOT/ndk/${{ inputs.ndk_version }}/source.properties"
+
+      - name: Fetch Node source
+        run: |
+          set -euo pipefail
+          V="${{ inputs.node_version }}"
+          curl -fsSLO "https://nodejs.org/dist/v${V}/node-v${V}.tar.gz"
+          tar -xzf "node-v${V}.tar.gz"
+          echo "NODE_SRC=$GITHUB_WORKSPACE/node-v${V}" >> "$GITHUB_ENV"
+
+      - name: Verify build prerequisites (fail fast)
+        run: |
+          set -euo pipefail
+          cd "$NODE_SRC"
+          echo "--- android_configure.py contract ---"
+          # Must take exactly 3 positional args and must NOT read ANDROID_NDK_HOME/ANDROID_API.
+          grep -n 'len(sys.argv) != 4' android_configure.py
+          if grep -qE 'ANDROID_NDK_HOME|ANDROID_API' android_configure.py; then
+            echo "Unexpected: android_configure.py reads env vars"; exit 1
+          fi
+          echo "--- --shared default must be None (we want an executable) ---"
+          grep -n "'--shared'" -A4 configure.py
+          echo "--- --with-intl default must be full-icu (login needs ICU) ---"
+          grep -n "with-intl" -A6 configure.py | head -30
+          echo "--- configure.py must NOT support --ldflags (16KB comes from NDK) ---"
+          if grep -q -- '--ldflags' configure.py; then echo "unexpected --ldflags"; fi
+
+      - name: Cross-compile Node (executable, full-icu)
+        run: |
+          set -euo pipefail
+          cd "$NODE_SRC"
+          # B2 fix: upstream android_configure.py sets only CC/CXX (cross compilers) and
+          # never CC_host, so host_arch misdetects as arm64 and host tools (node_js2c,
+          # torque, mksnapshot, genccode) get built as ARM binaries that cannot run here.
+          # Use gcc/g++ (guaranteed present on ubuntu runners); an EMPTY value would make
+          # configure.py fall back to the cross CC and silently reinstate the bug.
+          export CC_host="$(command -v gcc)"
+          export CXX_host="$(command -v g++)"
+          test -n "$CC_host"  || { echo "CC_host empty"; exit 1; }
+          test -n "$CXX_host" || { echo "CXX_host empty"; exit 1; }
+          echo "CC_host=$CC_host"
+          echo "CXX_host=$CXX_host"
+
+          # Exactly 3 positional args: <ndk> <api> <arch>
+          ./android-configure "$NDK_ROOT" 26 ${{ matrix.arch }}
+
+          echo "--- verify hosts tools will be x86_64 (B2) ---"
+          grep -E "^CC_host|^CXX_host" config.gypi config.mk 2>/dev/null || true
+
+          NPROC="$(nproc)"
+          echo "building with -j${NPROC}"
+          make -j"${NPROC}" 2>&1 | tail -200
+
+      - name: Verify ELF properties (hard gates)
+        run: |
+          set -euo pipefail
+          cd "$NODE_SRC"
+          BIN=out/Release/node
+          test -f "$BIN" || { echo "FATAL: no $BIN produced"; ls -la out/Release 2>/dev/null | head; exit 1; }
+          READELF="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+          echo "=== 1. must be an EXECUTABLE (not a shared lib) ==="
+          "$READELF" -h "$BIN" | grep -E 'Class:|Type:|Machine:|Entry point'
+          TYPE_LINE="$("$READELF" -h "$BIN" | grep 'Type:')"
+          ENTRY="$("$READELF" -h "$BIN" | grep 'Entry point address:' | awk '{print $NF}')"
+          echo "Type=$TYPE_LINE  Entry=$ENTRY"
+          # e_entry == 0 means ET_DYN shared object -> execve would ENOEXEC
+          if [ "$ENTRY" = "0x0" ]; then echo "FATAL: e_entry==0 -> shared library, not executable"; exit 1; fi
+
+          echo "=== 2. 16 KB page alignment on every PT_LOAD ==="
+          "$READELF" -lW "$BIN" | awk '/^  LOAD/ {print}' | while read -r line; do
+            echo "  $line"
+            ALIGN=$(echo "$line" | awk '{print $NF}')
+            OFF=$(echo "$line"   | awk '{print $2}')
+            VA=$(echo "$line"    | awk '{print $3}')
+            python3 - "$ALIGN" "$OFF" "$VA" <<'PY'
+          import sys
+          a = int(sys.argv[1], 16); off = int(sys.argv[2], 16); va = int(sys.argv[3], 16)
+          if a != 0x4000:
+              print(f"FATAL: p_align=0x{a:X}, expected 0x4000"); sys.exit(1)
+          if (va - off) % 0x4000 != 0:
+              print(f"FATAL: (vaddr-offset)%0x4000 = {(va-off)%0x4000}"); sys.exit(1)
+          PY
+          done
+          echo "16KB alignment OK"
+
+          echo "=== 3. full ICU alive (login path depends on it) ==="
+          # Can't run an arm64 binary on x86_64, so check the ICU data was linked in.
+          "$READELF" -p .rodata "$BIN" >/dev/null 2>&1 || true
+          if "$READELF" -sW "$BIN" 2>/dev/null | grep -qi 'ucol_\|unorm2_\|icudt'; then
+            echo "ICU symbols present (static ICU)"
+          else
+            echo "WARN: no ICU symbols found by nm; will verify functionally on device"
+          fi
+          nm -C "$BIN" 2>/dev/null | grep -ciE 'ucol_|unorm2_|icu_' || echo "0 icu symbols via nm"
+
+          echo "=== 4. size ==="
+          ls -lh "$BIN"
+          file "$BIN" || true
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          cd "$NODE_SRC"
+          mkdir -p dist
+          cp out/Release/node dist/libnode-${{ matrix.arch }}
+          cp out/Release/libc++_shared.so dist/ 2>/dev/null || \
+            cp "$NDK_ROOT"/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so dist/ 2>/dev/null || \
+            echo "libc++_shared.so not found (may be static)"
+          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded dist/libnode-${{ matrix.arch }} || true
+          ( cd dist && sha256sum * > SHA256SUMS && ls -la )
+          echo "=== artifact contents ==="
+          find dist -type f -printf '%p %s bytes\n'
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-android-${{ matrix.arch }}
+          path: ${{ env.NODE_SRC }}/dist/*
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          {
+            echo "## Node ${{ inputs.node_version }} for Android ${{ matrix.arch }}"
+            echo ""
+            echo "| property | value |"
+            echo "|---|---|"
+            echo "| NDK | ${{ inputs.ndk_version }} |"
+            echo "| Type | $("$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$NODE_SRC/out/Release/node" | grep 'Type:' | xargs) |"
+            echo "| Entry | $("$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$NODE_SRC/out/Release/node" | grep 'Entry point address' | xargs) |"
+            echo "| Size | $(du -h "$NODE_SRC/out/Release/node" | cut -f1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
