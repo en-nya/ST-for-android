@@ -119,6 +119,12 @@ jobs:
           echo "--- configure.py must NOT support --ldflags (16KB comes from NDK) ---"
           if grep -q -- '--ldflags' configure.py; then echo "unexpected --ldflags"; fi
 
+      - name: Apply Node Android patches
+        run: |
+          set -euo pipefail
+          chmod +x tools/apply-node-android-patches.sh
+          ./tools/apply-node-android-patches.sh "$NODE_SRC"
+
       - name: Cross-compile Node (executable, full-icu)
         run: |
           set -euo pipefail
