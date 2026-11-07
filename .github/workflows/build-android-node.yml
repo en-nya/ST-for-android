@@ -48,16 +48,39 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Android SDK + NDK
-        uses: android-actions/setup-android@v3
+      # NOTE: do NOT use android-actions/setup-android@v3 here.
+      # It internally runs `sdkmanager --install tools`, but the legacy "tools"
+      # package no longer exists in current SDK repositories, so the action fails
+      # with "Failed to find package 'tools'" before any of our steps run.
+      # ubuntu runners already ship a working SDK + cmdline-tools, so use them directly.
+      - name: Locate Android SDK
+        run: |
+          set -euo pipefail
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}" >> "$GITHUB_ENV"
 
       - name: Install NDK ${{ inputs.ndk_version }}
         run: |
           set -euo pipefail
-          yes | sdkmanager --install "ndk;${{ inputs.ndk_version }}" > /dev/null
-          echo "NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${{ inputs.ndk_version }}" >> "$GITHUB_ENV"
-          "$ANDROID_SDK_ROOT/ndk/${{ inputs.ndk_version }}/source.properties" | tail -5 || true
-          cat "$ANDROID_SDK_ROOT/ndk/${{ inputs.ndk_version }}/source.properties"
+          SDK="${ANDROID_SDK_ROOT}"
+          echo "SDK=$SDK"
+          ls "$SDK" || true
+          # find a usable sdkmanager (cmdline-tools/<ver>/bin)
+          SDKMGR="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1 || true)"
+          if [ -z "$SDKMGR" ]; then
+            echo "No sdkmanager found; downloading cmdline-tools"
+            mkdir -p "$SDK/cmdline-tools"
+            curl -fsSL -o /tmp/clt.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q /tmp/clt.zip -d /tmp/clt
+            mv /tmp/clt/cmdline-tools "$SDK/cmdline-tools/latest"
+            SDKMGR="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "using $SDKMGR"
+          yes | "$SDKMGR" --sdk_root="$SDK" --licenses > /dev/null || true
+          yes | "$SDKMGR" --sdk_root="$SDK" --install "ndk;${{ inputs.ndk_version }}" > /tmp/ndk-install.log 2>&1 || { tail -40 /tmp/ndk-install.log; exit 1; }
+          test -d "$SDK/ndk/${{ inputs.ndk_version }}" || { echo "NDK dir missing"; exit 1; }
+          echo "NDK_ROOT=$SDK/ndk/${{ inputs.ndk_version }}" >> "$GITHUB_ENV"
+          cat "$SDK/ndk/${{ inputs.ndk_version }}/source.properties"
 
       - name: Fetch Node source
         run: |
@@ -127,19 +150,20 @@ jobs:
           if [ "$ENTRY" = "0x0" ]; then echo "FATAL: e_entry==0 -> shared library, not executable"; exit 1; fi
 
           echo "=== 2. 16 KB page alignment on every PT_LOAD ==="
-          "$READELF" -lW "$BIN" | awk '/^  LOAD/ {print}' | while read -r line; do
-            echo "  $line"
-            ALIGN=$(echo "$line" | awk '{print $NF}')
-            OFF=$(echo "$line"   | awk '{print $2}')
-            VA=$(echo "$line"    | awk '{print $3}')
-            python3 - "$ALIGN" "$OFF" "$VA" <<'PY'
-          import sys
-          a = int(sys.argv[1], 16); off = int(sys.argv[2], 16); va = int(sys.argv[3], 16)
-          if a != 0x4000:
-              print(f"FATAL: p_align=0x{a:X}, expected 0x4000"); sys.exit(1)
-          if (va - off) % 0x4000 != 0:
-              print(f"FATAL: (vaddr-offset)%0x4000 = {(va-off)%0x4000}"); sys.exit(1)
-          PY
+          # Pure POSIX shell arithmetic with 16#hex (bash builtin) - no awk strtonum,
+          # no python heredoc, so this block is robust on the runner.
+          "$READELF" -lW "$BIN" | grep -E '^\s+LOAD' > /tmp/loads.txt || true
+          if [ ! -s /tmp/loads.txt ]; then echo "FATAL: no PT_LOAD segments"; exit 1; fi
+          cat /tmp/loads.txt | while IFS= read -r line; do
+            ALIGN=$(printf '%s' "$line" | awk '{print $NF}')
+            OFF=$(printf '%s' "$line"   | awk '{print $2}')
+            VA=$(printf '%s' "$line"    | awk '{print $3}')
+            AI=$((ALIGN)); OI=$((OFF)); VI=$((VA))     # bash understands 0x.. in $((  ))
+            echo "  off=$OFF va=$VA align=$ALIGN -> align=$AI"
+            if [ "$AI" -ne 16384 ]; then echo "FATAL: p_align=$AI, expected 16384"; exit 1; fi
+            if [ $(( (VI - OI) % 16384 )) -ne 0 ]; then
+              echo "FATAL: (vaddr-offset)%16384 = $(( (VI - OI) % 16384 ))"; exit 1
+            fi
           done
           echo "16KB alignment OK"
 
