@@ -59,12 +59,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Verification — fail loudly if the tree is still in a state that cannot link.
+# Verification — fail loudly if the gyp inputs are still in a state that
+# cannot link. Only the gyp files matter here: deps/zlib/*.c and BUILD.gn also
+# mention ARMV8_OS_ANDROID, but they are either guarded by `#if defined(...)`
+# (harmless once the define is gone) or not used by the gyp build at all.
 # ---------------------------------------------------------------------------
 echo "-- verify"
-if grep -rq "ARMV8_OS_ANDROID" deps/zlib/ 2>/dev/null; then
-  echo "FATAL: ARMV8_OS_ANDROID still referenced under deps/zlib"; exit 1
+if grep -n "ARMV8_OS_ANDROID" deps/zlib/zlib.gyp 2>/dev/null; then
+  echo "FATAL: zlib.gyp still defines ARMV8_OS_ANDROID"; exit 1
 fi
-echo "   zlib no longer takes the cpufeatures path"
+echo "   zlib.gyp no longer defines ARMV8_OS_ANDROID (getauxval path is selected)"
+if grep -q "ARMV8_OS_LINUX" deps/zlib/zlib.gyp; then
+  echo "   ARMV8_OS_LINUX present -> getauxval branch will compile"
+else
+  echo "FATAL: neither define present in zlib.gyp; unexpected tree state"; exit 1
+fi
 
 echo "== patches applied =="
