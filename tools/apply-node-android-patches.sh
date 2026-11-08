@@ -35,49 +35,55 @@ echo "source: $SRC"
 # We invoke it exactly as upstream documents (2-arg form).
 # ---------------------------------------------------------------------------
 echo "-- patch 0: disable V8 trap handler on Android (upstream node#36287 fix)"
-# Node ships android-patches/trap-handler.h.patch, and android_configure.py's
-# `patch` subcommand applies it via the external `patch` binary. That binary is
-# not guaranteed to exist on a minimal runner image, and the patch's own
-# pre-image text has drifted across Node versions (our v24.22.2 tree differs from
-# what the .patch file expects), so `patch -f` can silently no-op.
-#
-# Instead we perform the exact same transformation the patch describes: replace
-# the whole supported/unsupported #if/#elif/#else/#endif chain with a single
-# `#define V8_TRAP_HANDLER_SUPPORTED false`. We do it with a small Python script
-# that works on any Node version by locating the chain by its anchors.
+# Node ships android-patches/trap-handler.h.patch, applied by
+# `android_configure.py patch`. We do NOT invoke that subcommand: it shells out to
+# the external `patch` binary (not guaranteed on a minimal runner) and the .patch
+# file's pre-image has drifted from the current tree, so it can silently no-op.
+# Instead we perform the same transformation ourselves (see the Python block).
 python3 - <<'PY'
-import re, sys, pathlib
+import sys, pathlib
 
 p = pathlib.Path("deps/v8/src/trap-handler/trap-handler.h")
 src = p.read_text(encoding="utf-8")
 
-start_anchor = "// X64 on Linux, Windows, MacOS, FreeBSD."
-end_anchor = "#endif\n"
+# IMPORTANT: test for the thing that indicates an UNPATCHED file.
+# The string "V8_TRAP_HANDLER_SUPPORTED false" is NOT a reliable signal -- it
+# already occurs in the unpatched file's `#else` branch ("Everything else is
+# unsupported"), so testing for it reports "already patched" on a pristine tree
+# and exits 0 having done nothing. The reliable marker is that the unpatched file
+# still references V8_TRAP_HANDLER_VIA_SIMULATOR.
+if "V8_TRAP_HANDLER_VIA_SIMULATOR" not in src:
+    if "V8_TRAP_HANDLER_SUPPORTED false" in src:
+        print("   already patched (no simulator path present)")
+        sys.exit(0)
+    print("FATAL: neither the simulator path nor the patched define was found; "
+          "this tree does not look like Node's trap-handler.h")
+    sys.exit(1)
 
+start_anchor = "// X64 on Linux, Windows, MacOS, FreeBSD."
 i = src.find(start_anchor)
 if i == -1:
-    # Already patched, or anchors changed.
-    if "V8_TRAP_HANDLER_SUPPORTED false" in src:
-        print("   already patched (SUPPORTED false present)")
-        sys.exit(0)
-    print("FATAL: cannot find trap-handler chain start anchor")
+    # Anchor drifted. Fail LOUDLY rather than guessing or silently no-op'ing.
+    print("FATAL: cannot find the trap-handler conditional-chain start anchor "
+          f"(looked for: {start_anchor!r}).")
+    print("Refusing to continue: a silent no-op here costs a ~3h build before it "
+          "fails at the mksnapshot host link.")
     sys.exit(1)
 
-# Find the matching #endif that closes the chain: scan forward counting nesting.
+# Find the '#if' that opens the chain, then walk to its matching '#endif'.
 j = src.find("\n#if", i)
 if j == -1:
-    print("FATAL: cannot find '#if' after anchor")
+    print("FATAL: no '#if' found after the anchor")
     sys.exit(1)
+
 depth = 0
-k = j
-lines = src[j:].splitlines(keepends=True)
 pos = j
 closed_at = None
-for ln in lines:
-    stripped = ln.strip()
-    if stripped.startswith(("#if", "#ifdef", "#ifndef")):
+for ln in src[j:].splitlines(keepends=True):
+    s = ln.strip()
+    if s.startswith(("#if", "#ifdef", "#ifndef")):
         depth += 1
-    elif stripped.startswith("#endif"):
+    elif s.startswith("#endif"):
         depth -= 1
         if depth == 0:
             closed_at = pos + len(ln)
@@ -88,8 +94,7 @@ if closed_at is None:
     print("FATAL: unbalanced preprocessor chain in trap-handler.h")
     sys.exit(1)
 
-replacement = "#define V8_TRAP_HANDLER_SUPPORTED false\n"
-out = src[:i] + replacement + src[closed_at:]
+out = src[:i] + "#define V8_TRAP_HANDLER_SUPPORTED false\n" + src[closed_at:]
 p.write_text(out, encoding="utf-8")
 
 if "V8_TRAP_HANDLER_VIA_SIMULATOR" in out:
