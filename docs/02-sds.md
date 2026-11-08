@@ -225,6 +225,29 @@ pb.environment().apply {
 
 **`LD_LIBRARY_PATH` 是硬要求**：可执行文件被 `execve` 后，动态链接器**不会**自动在 `nativeLibraryDir` 找 `DT_NEEDED`。真实在跑的实现（`STpatch-NodeService.kt:270`）同样设置了它。
 
+### 2.3b ✅ exec 模型已用真实 APK 在 Android 14 上实证（2026-11-08）
+
+之前 SDS 只能说"按 SELinux 策略文档，`apk_data_file` 有 `execute`"。现在有**同一台设备上正反两面的实测**。
+
+**验证方法**：写一个最小 APK（`io.test.wx`），把探针编成 `jniLibs/x86_64/libprobe.so` 并让它的 `DT_NEEDED` 含 `libc++_shared.so`；用 `useLegacyPackaging = true` + `android:extractNativeLibs="true"` 打包；安装后从 `nativeLibraryDir` 执行。
+
+| 测试 | 条件 | **实测输出（原文）** | 结论 |
+|---|---|---|---|
+| **T1** | exec `nativeLibraryDir/libprobe.so` + 设 `LD_LIBRARY_PATH` | `exit=0  PROBE_OK argc=3 cxx=3` | ✅ **exec 模型成立**：APK 内作为 `lib*.so` 打包、被安装器解压到 `nativeLibraryDir` 的二进制**可以 execve** |
+| **T2**（反向对照） | 复制到 `filesDir` 后 exec | `IOException: Cannot run program "/data/user/0/io.test.wx/files/probe_copy": error=13, Permission denied` | ✅ **W^X 被实证**：从应用可写目录执行**确实被拒**（errno 13）。所以"必须放 `nativeLibraryDir`"不是保险，是**唯一可行路径** |
+| **T3**（负向验证） | 同 T1 但**不设** `LD_LIBRARY_PATH` | `exit=1  CANNOT LINK EXECUTABLE: library "libc++_shared.so" not found: needed by main executable` | ✅ **`LD_LIBRARY_PATH` 确实必需**（此前只是文档推断，现在是实测） |
+| **T4** | `canExecute()` | `true`（安装器保留了执行位） | ⚠ 但仍要显式断言（§2.3 N16），不能依赖 ROM 行为 |
+
+> **T1+T2 的组合是根基性验证**：`nativeLibraryDir` 能跑 / `filesDir` 不能跑，同一设备、同一二进制、同一进程上下文。
+> **复现**（工程在 `H:\Android\wxtest`）：
+> ```
+> adb install -r app-debug.apk
+> adb shell am start -n io.test.wx/.MainActivity
+> adb logcat -d -s WXTEST:*
+> ```
+> **⚠ 该验证是在 x86_64 模拟器（Android 14 / API 34 / 4KB 页）上做的**。它验证的是 **exec 机制**，不是 arm64 二进制本身。arm64 二进制**从未在任何设备上执行过**（详见 §11.3）。
+
+
 **`pb.directory(stDir)` 与 `process.chdir` 的关系（不矛盾）**：`server.js:11` 会 `process.chdir(serverDirectory)`，把 cwd 强制设为**模块所在目录**。所以 `pb.directory` 只是保证启动瞬间的相对路径可解析；**真正的 cwd 由 ST 自己决定**。
 
 **`--dataRoot` 的优先级已核对（`command-line.js:288-290`）**：
@@ -1171,14 +1194,16 @@ for i in 1..200:
 | **依赖库** | `DT_NEEDED` = `libm/libdl/liblog/libc++_shared/libc.so`，与 §2.1 预测**完全一致** |
 | **构建可复现** | 4 个构建失败已固化为补丁（§2.2b），单次全绿 151.6 分钟 |
 
-**❌ 仍未闭合（真机相关）**
-- [ ] 真机 `ProcessBuilder` 拉起，`GET /` 返回 200
-- [ ] **spawn 前断言 `nodeBin.canExecute()`**（§2.3）
-- [ ] `LD_LIBRARY_PATH` 缺失时能复现失败
-- [ ] `String.normalize` / `Intl.Collator` **在设备上**实际可用（构建机跑不了 aarch64）
-- [ ] 16KB **真机**（16KB 页设备）上不崩
+**❌ 仍未闭合（真机/arm64 相关）**
+- [x] ~~`LD_LIBRARY_PATH` 缺失时能复现失败~~ → ✅ **已关闭**：T3 实测 `library "libc++_shared.so" not found`（§2.3b）
+- [x] ~~从 `nativeLibraryDir` exec 是否可行~~ → ✅ **已关闭**：T1 `exit=0`；T2 反向对照 `error=13`（§2.3b）
+- [ ] **arm64 二进制在真机上跑起来**（**关键：从未发生**。本机 x86_64 上 QEMU2 明确不支持 arm64 镜像，实测报 `Avd's CPU Architecture 'arm64' is not supported by the QEMU2 emulator on x86_64 host`）
+- [ ] `String.normalize` / `Intl.Collator` **在设备上**实际可用（符号存在 ≠ 数据能加载）
+- [ ] Node 进程真的启动（V8 初始化 / JIT / 快照加载）
 - [ ] `--port 0` + P12 端口发现
-- [ ] `tools/` 与 `.github/workflows/` 入库后从零跑一次（当前已入库，需验证一次干净 clone 可用）
+- [ ] 16KB **真机**（16KB 页设备）上不崩 —— 本机模拟器是 **4KB 页**（`getconf PAGE_SIZE` = 4096），无法验证
+- [ ] `nodeBin.canExecute()` 在真机上 spawn 前断言
+- [ ] OEM 是否有额外 exec 阻断（U4）
 
 ---
 
