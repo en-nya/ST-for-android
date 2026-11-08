@@ -131,26 +131,45 @@
 | 项 | 规格 |
 |---|---|
 | 源码 | 官方 `nodejs/node` v24 LTS，**不 fork** |
-| 构建主机 | GitHub Actions `ubuntu-latest`（本机无 WSL/Docker，Node 的 Android 构建 Linux-only） |
+| 构建主机 | GitHub Actions `ubuntu-latest`（本机无 WSL/Docker，Node 的 Android 构建 Linux-only；已核实 `android_configure.py:13-15` 非 Linux/Darwin 直接 exit 1） |
 | 命令 | `./android-configure <NDK 绝对路径> 26 arm64 && make -j$(nproc)` |
+| **⚠ 必须先用 NDK r28+** | 16KB 对齐**只能靠 NDK r28+ 的链接器默认值**。`configure.py` **无 `--ldflags` 选项、不读 `$LDFLAGS`**（实测 0 命中），`android_configure.py` 调 configure 时参数写死、不转发 `"$@"` → **没有任何 flag 通道**。**已实测**：NDK r28c + 零 flag 编译 arm64，四个 `PT_LOAD` 全部 `p_align=0x4000` 且同余。**r27 的"两个 page-size flag"建议在本构建方式下不可实施，不要照抄。** |
 | **⚠ 参数必须是 3 个位置参数** | 脚本签名是 `len(sys.argv) != 4: usage; sys.exit(1)`（`android_configure_v24.py:21-23`），即 **`<ndk> <sdk> <arch>` 三个**。**它不读 `ANDROID_NDK_HOME` / `ANDROID_API` 环境变量**（grep 0 命中）。写 `./android-configure $NDK arm64`（2 个参数）会**直接 usage 退出** |
-| **⚠ 必须自己补 `CC_host`/`CXX_host`** | 上游脚本只设 `CC`/`CXX` 为 **NDK 的 aarch64 clang**，**不设 `CC_host`**（实测 grep 为空）；而 `configure.py:1326` 会读 `CC_host` 推断宿主架构。缺了它 → 宿主工具被误判为 arm64 → `node_js2c`/`torque`/`mksnapshot`/`genccode` 被编译成 **ARM64 二进制，在 x86_64 runner 上无法执行** → 构建失败。两个可用的 fork 都补了这一行（`njm-android_configure.py:69-70`） |
-| 构建前补丁 | **⚠ 不要盲抄 forks 的一行（审核 N5）**：<br>① 两个 fork 用的**不是同一个编译器**——`njm` 用 `command -v gcc`/`g++`，`fogtape` 用 `command -v clang`/`clang++`；<br>② **`clang` 在 `ubuntu-latest` runner 上不保证存在**（gcc/g++ 才有）。若 `$(command -v clang)` 取到**空值**，`configure.py:1274` 的 `shlex.split(cc or CC)` 会**回退到交叉用的 `CC`（aarch64 clang）**→ **静默地把 B2 那个 bug 装回去，且不报错**。<br>**正确做法**：用 **gcc/g++**（runner 必有），并**断言非空**：<br>`export CC_host=$(command -v gcc) CXX_host=$(command -v g++)`<br>`[ -n "$CC_host" ] && [ -n "$CXX_host" ] || { echo "host compiler missing"; exit 1; }`<br>③ **仍需实测确认**：`configure.py` 用 `CC_host` 只做**架构探测**，并不会把它写进 `config.gypi`；gyp 的 `_toolset=="host"` 段是否真拿到 `CC_host` 取决于 gyp 的环境传递 —— **CI 里必须验证宿主工具（`node_js2c`/`torque`/`mksnapshot`）确实是 x86_64 且可执行**（例如 `file out/host/Release/node_js2c` 或直接跑它）。 |
+| **⚠ 必须自己补 `CC_host`/`CXX_host`** | 上游脚本只设 `CC`/`CXX` 为 **NDK 的 aarch64 clang**，**不设 `CC_host`**（实测 grep 为空）；而 `configure.py:1506` 会读 `CC_host` 推断宿主架构。缺了它 → 宿主工具被误判为 arm64 → `node_js2c`/`torque`/`mksnapshot`/`genccode` 被编译成 **ARM64 二进制，在 x86_64 runner 上无法执行** → 构建失败。两个可用的 fork 都补了这一行（`njm-android_configure.py:69-70`） |
+| 构建前补丁 | **⚠ 不要盲抄 forks 的一行（审核 N5）**：<br>① 两个 fork 用的**不是同一个编译器**——`njm` 用 `command -v gcc`/`g++`，`fogtape` 用 `command -v clang`/`clang++`；<br>② **`clang` 在 `ubuntu-latest` runner 上不保证存在**（gcc/g++ 才有）。若 `$(command -v clang)` 取到**空值**，`configure.py:1454` 的 `shlex.split(cc or CC)` 会**回退到交叉用的 `CC`（aarch64 clang）**→ **静默地把 B2 那个 bug 装回去，且不报错**。<br>**正确做法**：用 **gcc/g++**（runner 必有），并**断言非空**：<br>`export CC_host=$(command -v gcc) CXX_host=$(command -v g++)`<br>`[ -n "$CC_host" ] && [ -n "$CXX_host" ] || { echo "host compiler missing"; exit 1; }`<br>③ **仍需实测确认**：`configure.py` 用 `CC_host` 只做**架构探测**，并不会把它写进 `config.gypi`；gyp 的 `_toolset=="host"` 段是否真拿到 `CC_host` 取决于 gyp 的环境传递 —— **CI 里必须验证宿主工具（`node_js2c`/`torque`/`mksnapshot`）确实是 x86_64 且可执行**（例如 `file out/host/Release/node_js2c` 或直接跑它）。 |
 | **关键** | **不传 `--shared`**（`configure.py` 的 `--shared` 默认 `None`）→ 产出**可执行文件** |
-| NDK | **r28+ 默认 16KB；r27 需要同时给 `--max-page-size=16384` 和 `--common-page-size=16384`**（Google 文档明确要求两个一起给；「r27d 默认就对齐」是**错的**） |
+| NDK | **必须 r28+**（16KB 由链接器默认值保证，见上行）。原写"r27 需给 `--max-page-size` + `--common-page-size`"——**在 `android_configure.py` 下无法实施，已作废** |
 | ICU | `--with-intl` 默认 `full-icu`，`<icu>.dat` 经 `genccode` **编进二进制**，无需 `NODE_ICU_DATA` |
 | 必备 flag | `--openssl-no-asm`（android_configure 已内置） |
 | 伴随库 | `libc++_shared.so`（**必须**，`DT_NEEDED` 含它） |
 
 ### 2.2 构建期门禁（CI，缺一不可）
-```
-① readelf -h  out/Release/node  → e_type 必须是 EXEC 或带 PT_INTERP 的 DYN；e_entry ≠ 0
-② readelf -l  out/Release/node  → 所有 PT_LOAD p_align == 16384 且 (vaddr - offset) % 0x4000 == 0
-③ node -e 'console.log("áz".normalize("NFD"))'   # full ICU 存活（users.js:645 依赖）
-④ node -e 'new Intl.Collator().compare("a","b")'  # Intl 存活
-⑤ node -e 'process.exit(0)'                        # 可执行位正常
-```
-> ⚠ **③④ 是硬门禁**：`--with-intl=none` 会让**每次登录**抛 TypeError（`users.js:645`），而这类构建"能启动、不能登录"，最难排查。**构建不过这两条直接失败。**
+
+> ⚠ **本节经真实构建修正（第 5 轮审核）**：原文把门禁③④写成"跑 `node -e ...`"，但那是 **aarch64 二进制，在 x86_64 runner 上根本跑不了**。实际可行的门禁必须是**静态可验证**的。下面同时给出"设计意图"和"CI 里真正能执行的检查"。
+
+| # | 门禁 | 设计意图 | CI 里怎么真正执行 | 失败后果 |
+|---|---|---|---|---|
+| ① | **是可执行文件** | `e_entry ≠ 0`（`.so` 的 `e_entry=0`，`execve` 会 ENOEXEC） | `llvm-readelf -h` 取 Entry point，断言 `!= 0x0` | APK 装好后 `libnode.so` 起不来 |
+| ② | **16KB 页对齐** | 每个 `PT_LOAD` `p_align=0x4000` 且 `(vaddr-offset)%0x4000==0` | `llvm-readelf -lW` + shell 算术（**已实测本机算法正反向都正确**） | Android 15+ 16KB 设备 SIGSEGV；Play 拒收 |
+| ③ | **full ICU 已编入** | 登录路径 `users.js:645` 用 `String.normalize()` | **不能跑二进制** → 只能静态查：`nm`/`readelf -s` 找 `unorm2_*`/`ucol_*`/`icudt` 符号，**并且必须 `exit 1`**（只 warn 等于没有门禁） | 能启动、**永远登不了录** |
+| ④ | **Intl 可用** | `Intl.Collator` 等 | 同③，与③合并为一次符号扫描 | 排序/本地化异常 |
+| ⑤ | **可执行位** | `chmod +x` 后在 APK 里能 exec | `test -x`（构建机上），运行时另有 `canExecute()` 断言（§2.3） | `EACCES` |
+
+> **⚠ ③④ 是硬门禁**：`--with-intl=none` 会让**每次登录**抛 TypeError（`users.js:645`），而这类构建"能启动、不能登录"，最难排查。**符号扫描不到 ICU 就必须 `exit 1`，不能只打 WARN。**
+> **待办（M0 关闭前）**：把 ③ 的 WARN 改成硬失败，并补一条"用 `readelf -sW | grep -c 'unorm2_'` 断言 > 0"的检查。当前 CI 里这条还是软警告 —— 已在 §12 记为 U16。
+
+### 2.2b 【第 5 轮审核补充】真实构建踩到的 4 个坑（原文完全未记录）
+
+这四个失败都是**实际构建时炸出来的**，每个都吃掉 10 分钟到 3 小时。SDS 原文一条都没写，违反 §11.0 自己的规则。现按"症状 → 根因 → 修法 → 是否已固化"记录：
+
+| # | 症状 | 根因 | 修法 | 已固化？ |
+|---|---|---|---|---|
+| **B1** | `android-actions/setup-android@v3` 失败：`Failed to find package 'tools'` | 该 action 内部执行 `sdkmanager --install tools`，而 Google **已移除** `tools` 这个包 | **不要用这个 action**；runner 自带可用的 SDK，直接定位 `$ANDROID_SDK_ROOT` 并用 `cmdline-tools/*/bin/sdkmanager` | ✅ 已从 workflow 移除 |
+| **B2** | `yes \| sdkmanager --licenses` 后 job 突然 abort，日志只有 `yes: standard output: Broken pipe` | `sdkmanager` 接受完就退出，`yes` 收到 SIGPIPE；在 `set -o pipefail` 下退出码非 0 → 整个 step 失败 | **不要用 `yes \|`**；用 `printf 'y\n%.0s' $(seq 1 200) > /tmp/lic.txt` 再从文件重定向，并 `\|\| true` 容忍退出码 | ✅ |
+| **B3** | `ld.lld: error: undefined symbol: android_getCpuFeatures`（链接 `openssl-cli` 时） | `deps/zlib/zlib.gyp` 在 Android 上定义 `ARMV8_OS_ANDROID` → `cpu_features.c:109` 调 NDK 的 cpufeatures 库，而 Node 的 gyp **从不链接**该库 | 把该 define 改成 `ARMV8_OS_LINUX`，走 `cpu_features.c:117` 的 `getauxval(AT_HWCAP)` 分支（bionic 的 libc 自带，语义等价：同样读 CRC32/PMULL 位） | ✅ 已写进 `apply-node-android-patches.sh` |
+| **B4** | **约 3 小时后**，链接 **host 工具** `mksnapshot` 失败：`undefined reference to v8::internal::trap_handler::TryHandleSignal` / `RegisterDefaultTrapHandler` / `v8_internal_simulator_ProbeMemory`，且链接里出现 `simulator-arm64.o` | `deps/v8/src/trap-handler/trap-handler.h:33-37` 在 **`V8_TARGET_ARCH_ARM64 && V8_HOST_ARCH_X64 && V8_OS_LINUX`** 时启用 `V8_TRAP_HANDLER_VIA_SIMULATOR`。交叉编译时 **host toolset 用 `OS=linux` 编译，却继承了 `v8_target_arch=arm64`** → host 工具走 simulator 路径 → 其汇编/实现对 host toolset 不可链接。**注意：这与 `CC_host` 是两回事**——即使 host 工具正确编成 x86_64，这条路径依然会炸 | Node **自带**修复：`android-patches/trap-handler.h.patch` 把整段条件链替换成 `#define V8_TRAP_HANDLER_SUPPORTED false`。官方入口是 `./android-configure patch`，但**依赖外部 `patch` 二进制**、且该 `.patch` 的 pre-image 会随版本漂移。我们改为用 Python 做等价变换（按锚点定位整条 `#if/#elif/#else/#endif` 链并替换），不依赖 `patch` | ✅ 已写进 patch 脚本，**本机实测 223→185 行、`VIA_SIMULATOR` 清零、`#if/#endif` 配对平衡** |
+
+> **关键教训（写进 §11.0 规则）**：`configure.py` **完全没有 LDFLAGS 通道**（无 `--ldflags` 选项、不读 `$LDFLAGS`，实测 0 命中）。所以 §2.1 里"r27 需要给 `--max-page-size` 和 `--common-page-size`"这条**在 `android_configure.py` 下无法实施**——它调 configure 时用的是写死的参数表，不转发 `"$@"`。**唯一可行做法是直接用 r28+**，让链接器默认产出 16KB（已实测：零 flag 下 `p_align=0x4000`）。
 
 ### 2.3 启动参数与环境
 
@@ -1138,14 +1157,21 @@ for i in 1..200:
 | G5 | 第三方按 README 从零构建出同一 APK（哈希可不同，功能一致） |
 
 ### 11.3 M0 出口（**必须真机，不能纸上过**）
-- [ ] CI 产出**可执行** Node（`readelf` 三条门禁全过）
-- [ ] 宿主工具（`node_js2c`/`torque`/`mksnapshot`）确为 x86_64 且可执行（见 §2.1 的 `CC_host` 说明）
+
+> **当前真实进度（第 5 轮审核记录，勿乐观解读）：0/8 已关闭。**
+> 已有：SDK/NDK 装好（`H:\Android\Sdk`，NDK 28.2.13676358）；16KB 对齐**已用真实 NDK 产物实测确认**；Node 源码 5 条构建前提**已逐条 grep 确认**；4 个真实构建失败**已诊断并固化成补丁**。
+> **仍缺**：`out/Release/node` 尚未产出。因此下表除第 7 项外全部**未闭合**。
+
+- [ ] CI 产出**可执行** Node（① `e_entry≠0` + ② 16KB 门禁全过）
+- [ ] **ICU 符号门禁为硬失败**（当前 CI 里仍是 WARN，见 U16）
+- [ ] 宿主工具（`node_js2c`/`torque`/`mksnapshot`）确为 x86_64 且**链接成功**（`CC_host` 与 trap-handler 是两个独立问题，都已修，但需一次完整绿灯证明）
 - [ ] 真机 `ProcessBuilder` 拉起，`GET /` 返回 200
 - [ ] **spawn 前断言 `nodeBin.canExecute()`**（不能省，见 §2.3 N16）
 - [ ] `LD_LIBRARY_PATH` 缺失时**能复现失败**（证明这行配置是必要的）
-- [ ] `String.normalize` / `Intl.Collator` 在设备上可用
-- [ ] 16KB 对齐在真机 16KB 设备上不崩
-- [ ] `--port 0` + **P12 写 `files/meta/port`** 是否让启动器拿到真实端口（**不要**再用"从日志读回"——已实测日志打印的是配置端口 `:0`）
+- [x] **16KB 对齐** —— ✅ **已关闭**：NDK r28c 零 flag 编译 arm64，`llvm-readelf -lW` 实测四个 `PT_LOAD` 均 `p_align=0x4000` 且 `(vaddr-offset)%0x4000==0`
+- [ ] `String.normalize` / `Intl.Collator` 在**设备上**可用（构建机跑不了 aarch64 二进制）
+- [ ] 16KB **真机**（16KB 页设备）上不崩
+- [ ] `--port 0` + **P12 写 `files/meta/port`** 让启动器拿到真实端口
 
 ---
 
@@ -1168,6 +1194,9 @@ for i in 1..200:
 | **U13** | **`basicAuthMode` 在 `listen:false` 时不挂载**（已核实 `:141`）→ 必须 `listen:true` | 空鉴权 | ✅ 已在设计里固化 |
 | **U14** | **`setHttpAuthUsernamePassword` 在各 OEM WebView 上是否都自动应答挑战**（不回弹窗） | 用户看到登录框 | M2 真机 |
 | **U15** | ~~明文凭据存在 `files/data/config.yaml` 里的暴露面~~ | ✅ **已消除**：改用 `SILLYTAVERN_BASICAUTHUSER_*` 环境变量（`util.js:88-95` env 优先），密码不落盘、每次启动轮换 | 已关闭 |
+| **U16** | **ICU 门禁在 CI 里只是 WARN，不是硬失败**（第 5 轮审核实测：该分支无 `exit 1`） | 可能产出"能启动、不能登录"的包 | **M0 前必须改成硬失败** |
+| **U17** | **`tools/` 与 `.github/workflows/` 尚未进入仓库根**（当前 workflow 与脚本在 `.work/ci/`，靠手工拷贝运行） | G4/G5「可复现构建」不成立 | M0 |
+| **U18** | **构建从未完整绿灯一次**（4 个失败已修，但终点未达） | 主线 | M0 |
 
 ---
 
@@ -1196,7 +1225,7 @@ if (global && !request.user.profile.admin) {
 
 ---
 
-*本 SDS 待第三轮审核。*
+*本 SDS 已过 5 轮独立审核（计划 2 轮 + SDS 3 轮以上）。第 5 轮基于**真实 Android 构建证据**，补齐了 §2.2b 的 4 个构建失败记录。*
 
 ---
 

@@ -185,15 +185,31 @@ jobs:
           done
           echo "16KB alignment OK"
 
-          echo "=== 3. full ICU alive (login path depends on it) ==="
-          # Can't run an arm64 binary on x86_64, so check the ICU data was linked in.
-          "$READELF" -p .rodata "$BIN" >/dev/null 2>&1 || true
-          if "$READELF" -sW "$BIN" 2>/dev/null | grep -qi 'ucol_\|unorm2_\|icudt'; then
-            echo "ICU symbols present (static ICU)"
-          else
-            echo "WARN: no ICU symbols found by nm; will verify functionally on device"
+          echo "=== 3. full ICU alive (HARD GATE: login path depends on it) ==="
+          # src/users.js:645 calls String.prototype.normalize() on the login path.
+          # An --with-intl=none build starts fine and then can never log in - the
+          # worst possible failure mode, so this must FAIL the build, not warn.
+          #
+          # We cannot execute an aarch64 binary on an x86_64 runner, so we verify
+          # statically that ICU was linked in. Node embeds ICU data via genccode
+          # (icu-generic.gyp), producing icudt*_dat symbols plus ucol_/unorm2_ APIs.
+          ICU_COUNT="$("$READELF" -sW "$BIN" 2>/dev/null | grep -cE 'ucol_|unorm2_|icu_|icudt' || true)"
+          echo "ICU-related symbols: $ICU_COUNT"
+          if [ "${ICU_COUNT:-0}" -lt 10 ]; then
+            echo "FATAL: only $ICU_COUNT ICU symbols in the binary."
+            echo "This looks like an --with-intl=none / small-icu build."
+            echo "Such a build CANNOT log in (src/users.js:645 uses String.normalize())."
+            echo "Refusing to ship it. Check that --with-intl defaults to full-icu."
+            exit 1
           fi
-          nm -C "$BIN" 2>/dev/null | grep -ciE 'ucol_|unorm2_|icu_' || echo "0 icu symbols via nm"
+          echo "ICU symbols present ($ICU_COUNT) -> full ICU statically embedded"
+
+          # Extra confirmation: the embedded ICU data blob (genccode output).
+          if "$READELF" -sW "$BIN" 2>/dev/null | grep -qE 'icudt[0-9]+_dat'; then
+            echo "embedded ICU data blob (icudt*_dat) found"
+          else
+            echo "WARN: no icudt*_dat symbol; ICU may be linked but not data-embedded"
+          fi
 
           echo "=== 4. size ==="
           ls -lh "$BIN"
