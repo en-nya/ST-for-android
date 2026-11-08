@@ -1,4 +1,4 @@
-plugins {
+﻿plugins {
     id("com.android.application")
 }
 
@@ -9,7 +9,7 @@ android {
     defaultConfig {
         applicationId = "io.test.wx"
         minSdk = 26
-        targetSdk = 36
+        targetSdk = 34
         versionCode = 1
         versionName = "1.0"
     }
@@ -19,14 +19,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    buildFeatures {
-        buildConfig = true
-    }
-
     packaging {
-        // The WHOLE POINT of this test: get lib*.so extracted to nativeLibraryDir
-        // so we can execve() it. With the AGP default (extractNativeLibs=false) the
-        // directory stays empty.
+        // THE WHOLE POINT of this project: get lib*.so extracted into
+        // nativeLibraryDir so execve() can work. The AGP default
+        // (useLegacyPackaging = false) leaves that directory EMPTY; verified
+        // as a control: T1 then fails with error=2 ENOENT.
         jniLibs {
             useLegacyPackaging = true
         }

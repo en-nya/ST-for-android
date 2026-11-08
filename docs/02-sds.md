@@ -167,7 +167,7 @@
 | **B1** | `android-actions/setup-android@v3` 失败：`Failed to find package 'tools'` | 该 action 内部执行 `sdkmanager --install tools`，而 Google **已移除** `tools` 这个包 | **不要用这个 action**；runner 自带可用的 SDK，直接定位 `$ANDROID_SDK_ROOT` 并用 `cmdline-tools/*/bin/sdkmanager` | ✅ 已从 workflow 移除 |
 | **B2** | `yes \| sdkmanager --licenses` 后 job 突然 abort，日志只有 `yes: standard output: Broken pipe` | `sdkmanager` 接受完就退出，`yes` 收到 SIGPIPE；在 `set -o pipefail` 下退出码非 0 → 整个 step 失败 | **不要用 `yes \|`**；用 `printf 'y\n%.0s' $(seq 1 200) > /tmp/lic.txt` 再从文件重定向，并 `\|\| true` 容忍退出码 | ✅ |
 | **B3** | `ld.lld: error: undefined symbol: android_getCpuFeatures`（链接 `openssl-cli` 时） | `deps/zlib/zlib.gyp` 在 Android 上定义 `ARMV8_OS_ANDROID` → `cpu_features.c:109` 调 NDK 的 cpufeatures 库，而 Node 的 gyp **从不链接**该库 | 把该 define 改成 `ARMV8_OS_LINUX`，走 `cpu_features.c:117` 的 `getauxval(AT_HWCAP)` 分支（bionic 的 libc 自带，语义等价：同样读 CRC32/PMULL 位） | ✅ 已写进 `apply-node-android-patches.sh` |
-| **B4** | **约 3 小时后**，链接 **host 工具** `mksnapshot` 失败：`undefined reference to v8::internal::trap_handler::TryHandleSignal` / `RegisterDefaultTrapHandler` / `v8_internal_simulator_ProbeMemory`，且链接里出现 `simulator-arm64.o` | `deps/v8/src/trap-handler/trap-handler.h:33-37` 在 **`V8_TARGET_ARCH_ARM64 && V8_HOST_ARCH_X64 && V8_OS_LINUX`** 时启用 `V8_TRAP_HANDLER_VIA_SIMULATOR`。交叉编译时 **host toolset 用 `OS=linux` 编译，却继承了 `v8_target_arch=arm64`** → host 工具走 simulator 路径 → 其汇编/实现对 host toolset 不可链接。**注意：这与 `CC_host` 是两回事**——即使 host 工具正确编成 x86_64，这条路径依然会炸 | Node **自带**修复：`android-patches/trap-handler.h.patch` 把整段条件链替换成 `#define V8_TRAP_HANDLER_SUPPORTED false`。官方入口是 `./android-configure patch`，但**依赖外部 `patch` 二进制**、且该 `.patch` 的 pre-image 会随版本漂移。我们改为用 Python 做等价变换（按锚点定位整条 `#if/#elif/#else/#endif` 链并替换），不依赖 `patch` | ✅ 已写进 patch 脚本，**本机实测 223→185 行、`VIA_SIMULATOR` 清零、`#if/#endif` 配对平衡** |
+| **B4** | **约 3 小时后**，链接 **host 工具** `mksnapshot` 失败：`undefined reference to v8::internal::trap_handler::TryHandleSignal` / `RegisterDefaultTrapHandler` / `v8_internal_simulator_ProbeMemory`，且链接里出现 `simulator-arm64.o` | `deps/v8/src/trap-handler/trap-handler.h:33-37` 在 **`V8_TARGET_ARCH_ARM64 && V8_HOST_ARCH_X64 && V8_OS_LINUX`** 时启用 `V8_TRAP_HANDLER_VIA_SIMULATOR`。交叉编译时 **host toolset 用 `OS=linux` 编译，却继承了 `v8_target_arch=arm64`** → host 工具走 simulator 路径 → 其汇编/实现对 host toolset 不可链接。**注意：这与 `CC_host` 是两回事**——即使 host 工具正确编成 x86_64，这条路径依然会炸 | Node **自带**修复：`android-patches/trap-handler.h.patch` 把整段条件链替换成 `#define V8_TRAP_HANDLER_SUPPORTED false`。官方入口是 `./android-configure patch`，但**依赖外部 `patch` 二进制**、且该 `.patch` 的 pre-image 会随版本漂移。我们改为用 Python 做等价变换（按锚点定位整条 `#if/#elif/#else/#endif` 链并替换），不依赖 `patch`；**锚点漂移时 exit 1 而非静默跳过**（否则要等 3 小时才在 mksnapshot 链接处失败） | ✅ 已写进 patch 脚本，**本机实测 223→185 行、`VIA_SIMULATOR` 清零、`#if/#endif` 配对平衡** |
 
 > **关键教训（写进 §11.0 规则）**：`configure.py` **完全没有 LDFLAGS 通道**（无 `--ldflags` 选项、不读 `$LDFLAGS`，实测 0 命中）。所以 §2.1 里"r27 需要给 `--max-page-size` 和 `--common-page-size`"这条**在 `android_configure.py` 下无法实施**——它调 configure 时用的是写死的参数表，不转发 `"$@"`。**唯一可行做法是直接用 r28+**，让链接器默认产出 16KB（已实测：零 flag 下 `p_align=0x4000`）。
 
@@ -234,18 +234,29 @@ pb.environment().apply {
 | 测试 | 条件 | **实测输出（原文）** | 结论 |
 |---|---|---|---|
 | **T1** | exec `nativeLibraryDir/libprobe.so` + 设 `LD_LIBRARY_PATH` | `exit=0  PROBE_OK argc=3 cxx=3` | ✅ **exec 模型成立**：APK 内作为 `lib*.so` 打包、被安装器解压到 `nativeLibraryDir` 的二进制**可以 execve** |
-| **T2**（反向对照） | 复制到 `filesDir` 后 exec | `IOException: Cannot run program "/data/user/0/io.test.wx/files/probe_copy": error=13, Permission denied` | ✅ **W^X 被实证**：从应用可写目录执行**确实被拒**（errno 13）。所以"必须放 `nativeLibraryDir`"不是保险，是**唯一可行路径** |
-| **T3**（负向验证） | 同 T1 但**不设** `LD_LIBRARY_PATH` | `exit=1  CANNOT LINK EXECUTABLE: library "libc++_shared.so" not found: needed by main executable` | ✅ **`LD_LIBRARY_PATH` 确实必需**（此前只是文档推断，现在是实测） |
-| **T4** | `canExecute()` | `true`（安装器保留了执行位） | ⚠ 但仍要显式断言（§2.3 N16），不能依赖 ROM 行为 |
+| **T2**（反向对照） | 复制到 `filesDir` 后 exec | `IOException: ... error=13, Permission denied`；内核 AVC：`avc: denied { execute_no_trans } ... scontext=u:r:untrusted_app tcontext=u:object_r:app_data_file:s0` | ✅ **W^X 被实证**。注意：被拒是 **SELinux**（`app_data_file` vs `apk_data_file`），文件实际是 0711（x 位已设）仍被拒 → **`setExecutable()` 修不了** |
+| **T3** | exec `nativeLibraryDir/libprobe.so` + **不设** `LD_LIBRARY_PATH` | `exit=1  CANNOT LINK EXECUTABLE ".../libprobe.so": library "libc++_shared.so" not found: needed by main executable` | ✅ **`LD_LIBRARY_PATH` 确实必需**。且 `libc++_shared.so` 就在同一目录 → 证明 **bionic 不搜索可执行文件自身目录**（审核另行实测：两文件同目录、不设 `LD_LIBRARY_PATH` 仍 `CANNOT LINK`；设了则 `PROBE_OK`） |
+| **T4** | `canExecute()` | `true` | ⚠ **机制说明更正（审核核实）**：不是"安装器保留了执行位"——APK 里 zip entry 是 `0100644`（无 x 位），是**安装器解压时创建为 0755**。结论（要显式断言）不变，但理由不同 |
 
 > **T1+T2 的组合是根基性验证**：`nativeLibraryDir` 能跑 / `filesDir` 不能跑，同一设备、同一二进制、同一进程上下文。
+>
+> **⚠ W^X 不是绝对的（审核 T5/T6 实测，必须记录）**：`execve` 直接执行 `filesDir` 里的文件确实被 SELinux 拒（T2）；**但** 用 `linker64 <path>` 把它当**解释器的输入**加载则**可以跑**：
+> ```
+> T5: linker64 /data/.../files/probe_copy  -> exit=0 PROBE_OK   （无 AVC 拒绝）
+> T6: 同一文件直接 exec                        -> error=13
+> ```
+> 因为 `linker64` 只是 **read+mmap** 该文件（不需要 `execute_no_trans`）。
+> **对项目的含义**：这**不**意味着我们可以走这条路——① 它依赖 `linker64` 存在于 `/system/bin`（有，但要硬编码路径）；② 它绕过了 SELinux 的 W^X 设计意图，属于**平台不推荐、未来可能被封堵**的用法；③ 我们用 `nativeLibraryDir` 是**官方支持的干净路径**，没必要冒险。**记录它是为了诚实**：SDS 不能声称"filesDir 绝对跑不了"。
+>
+> **⚠ 关键局限（审核强化，必须与上表同权重阅读）**：T1–T4 用的是 **5.5KB 的 `printf` 探针**，而真实目标是 **~90MB 的 Node**。二者之间隔着：V8 初始化/JIT/快照加载、多线程、长生命周期、信号处理、LMK。**"一个 PIE 能 exec" ≠ "Node 能跑"。**
+> 审核还实测：42KB/2MB/8MB/20MB/62MB 的合成 PIE **都能跑**（说明体积本身不是问题）；但把 `.work/dl/njm/` 里那个 **62MB x86_64 `libnode.so`** 直接执行会 **SIGSEGV (RC=139)** —— 原因正是它 **`PT_INTERP: False`**（是 `--shared` 共享库，见 §3.2.1），用 `linker64` 硬当程序加载当然崩。**这反过来印证了本文档 §3.2.1 的判断，不是反例。**
 > **复现**（工程在 `H:\Android\wxtest`）：
 > ```
 > adb install -r app-debug.apk
 > adb shell am start -n io.test.wx/.MainActivity
 > adb logcat -d -s WXTEST:*
 > ```
-> **⚠ 该验证是在 x86_64 模拟器（Android 14 / API 34 / 4KB 页）上做的**。它验证的是 **exec 机制**，不是 arm64 二进制本身。arm64 二进制**从未在任何设备上执行过**（详见 §11.3）。
+> **⚠ 该验证是在 x86_64 模拟器（Android 14 / API 34 / 4KB 页 / **Google userdebug 镜像**，`ro.debuggable=1`，比量产 user 版宽松）上做的**。它验证的是 **exec 机制**，**不是** arm64 二进制、**不是** 16KB 页设备、**不是** 90MB 载荷、**不是**长驻进程、**不是** OEM ROM。arm64 二进制**至今从未在任何设备上执行过**（详见 §11.3）。
 
 
 **`pb.directory(stDir)` 与 `process.chdir` 的关系（不矛盾）**：`server.js:11` 会 `process.chdir(serverDirectory)`，把 cwd 强制设为**模块所在目录**。所以 `pb.directory` 只是保证启动瞬间的相对路径可解析；**真正的 cwd 由 ST 自己决定**。
@@ -1195,15 +1206,16 @@ for i in 1..200:
 | **构建可复现** | 4 个构建失败已固化为补丁（§2.2b），单次全绿 151.6 分钟 |
 
 **❌ 仍未闭合（真机/arm64 相关）**
-- [x] ~~`LD_LIBRARY_PATH` 缺失时能复现失败~~ → ✅ **已关闭**：T3 实测 `library "libc++_shared.so" not found`（§2.3b）
-- [x] ~~从 `nativeLibraryDir` exec 是否可行~~ → ✅ **已关闭**：T1 `exit=0`；T2 反向对照 `error=13`（§2.3b）
 - [ ] **arm64 二进制在真机上跑起来**（**关键：从未发生**。本机 x86_64 上 QEMU2 明确不支持 arm64 镜像，实测报 `Avd's CPU Architecture 'arm64' is not supported by the QEMU2 emulator on x86_64 host`）
 - [ ] `String.normalize` / `Intl.Collator` **在设备上**实际可用（符号存在 ≠ 数据能加载）
-- [ ] Node 进程真的启动（V8 初始化 / JIT / 快照加载）
+- [ ] **Node 进程真的启动**（V8 初始化 / JIT / 快照加载 / 多线程 / 长生命周期）—— 已实测"PIE 能 exec"（5.5KB 探针）与"Node 能跑"是**两件事**
 - [ ] `--port 0` + P12 端口发现
 - [ ] 16KB **真机**（16KB 页设备）上不崩 —— 本机模拟器是 **4KB 页**（`getconf PAGE_SIZE` = 4096），无法验证
 - [ ] `nodeBin.canExecute()` 在真机上 spawn 前断言
 - [ ] OEM 是否有额外 exec 阻断（U4）
+- [ ] **量产 `user` 版 ROM**（本机是 `ro.debuggable=1` 的 userdebug 镜像，比量产宽松）
+
+**（原本列在此处的两项已移到上方"已关闭"表：`nativeLibraryDir` exec 可行性、`LD_LIBRARY_PATH` 必要性。）**
 
 ---
 
