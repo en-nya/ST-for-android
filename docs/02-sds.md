@@ -1203,7 +1203,7 @@ for i in 1..200:
 | **门禁③ full ICU** | **8,724 个 ICU 符号**，含 `icu_78` 命名空间、`unorm2_`×22（`String.normalize` 依赖）、`icudt` 数据块 |
 | **产物完整性** | 下载后自算 SHA256 = `0cdc2c43…09356`，与仓库 `SHA256SUMS` **逐字节一致** |
 | **依赖库** | `DT_NEEDED` = `libm/libdl/liblog/libc++_shared/libc.so`，与 §2.1 预测**完全一致** |
-| **构建可复现** | 4 个构建失败已固化为补丁（§2.2b），单次全绿 151.6 分钟 |
+| **构建可复现** | ✅ **两次独立构建 SHA256 完全一致**：run `42418429182`（151.6min）与 run `42432158282`（102min）产物均为 `0cdc2c43…09356`，字节级可复现 |
 
 **❌ 仍未闭合（真机/arm64 相关）**
 - [ ] **arm64 二进制在真机上跑起来**（**关键：从未发生**。本机 x86_64 上 QEMU2 明确不支持 arm64 镜像，实测报 `Avd's CPU Architecture 'arm64' is not supported by the QEMU2 emulator on x86_64 host`）
