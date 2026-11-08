@@ -1158,20 +1158,27 @@ for i in 1..200:
 
 ### 11.3 M0 出口（**必须真机，不能纸上过**）
 
-> **当前真实进度（第 5 轮审核记录，勿乐观解读）：0/8 已关闭。**
-> 已有：SDK/NDK 装好（`H:\Android\Sdk`，NDK 28.2.13676358）；16KB 对齐**已用真实 NDK 产物实测确认**；Node 源码 5 条构建前提**已逐条 grep 确认**；4 个真实构建失败**已诊断并固化成补丁**。
-> **仍缺**：`out/Release/node` 尚未产出。因此下表除第 7 项外全部**未闭合**。
+> **当前真实进度（2026-11-08 实测更新）：构建产物已产出并通过全部静态门禁；真机项仍未闭合。**
 
-- [ ] CI 产出**可执行** Node（① `e_entry≠0` + ② 16KB 门禁全过）
-- [ ] **ICU 符号门禁为硬失败**（当前 CI 里仍是 WARN，见 U16）
-- [ ] 宿主工具（`node_js2c`/`torque`/`mksnapshot`）确为 x86_64 且**链接成功**（`CC_host` 与 trap-handler 是两个独立问题，都已修，但需一次完整绿灯证明）
+**✅ 已关闭（有实测证据）**
+| 项 | 证据 |
+|---|---|
+| **CI 产出可执行 Node** | run `42418429182` 全 13 步 success；产物 35.7MB zip |
+| **门禁① 可执行文件** | `llvm-readelf -h`：`e_entry=0x3898000`（≠0）、`PT_INTERP=/system/bin/linker64` → **真 PIE 可执行文件**，与 fogtape 的 `e_entry=0x0` 有本质区别 |
+| **门禁② 16KB 对齐** | 4 个 `PT_LOAD` 全部 `p_align=0x4000` 且同余 0（NDK r28c 零 flag） |
+| **门禁③ full ICU** | **8,724 个 ICU 符号**，含 `icu_78` 命名空间、`unorm2_`×22（`String.normalize` 依赖）、`icudt` 数据块 |
+| **产物完整性** | 下载后自算 SHA256 = `0cdc2c43…09356`，与仓库 `SHA256SUMS` **逐字节一致** |
+| **依赖库** | `DT_NEEDED` = `libm/libdl/liblog/libc++_shared/libc.so`，与 §2.1 预测**完全一致** |
+| **构建可复现** | 4 个构建失败已固化为补丁（§2.2b），单次全绿 151.6 分钟 |
+
+**❌ 仍未闭合（真机相关）**
 - [ ] 真机 `ProcessBuilder` 拉起，`GET /` 返回 200
-- [ ] **spawn 前断言 `nodeBin.canExecute()`**（不能省，见 §2.3 N16）
-- [ ] `LD_LIBRARY_PATH` 缺失时**能复现失败**（证明这行配置是必要的）
-- [x] **16KB 对齐** —— ✅ **已关闭**：NDK r28c 零 flag 编译 arm64，`llvm-readelf -lW` 实测四个 `PT_LOAD` 均 `p_align=0x4000` 且 `(vaddr-offset)%0x4000==0`
-- [ ] `String.normalize` / `Intl.Collator` 在**设备上**可用（构建机跑不了 aarch64 二进制）
+- [ ] **spawn 前断言 `nodeBin.canExecute()`**（§2.3）
+- [ ] `LD_LIBRARY_PATH` 缺失时能复现失败
+- [ ] `String.normalize` / `Intl.Collator` **在设备上**实际可用（构建机跑不了 aarch64）
 - [ ] 16KB **真机**（16KB 页设备）上不崩
-- [ ] `--port 0` + **P12 写 `files/meta/port`** 让启动器拿到真实端口
+- [ ] `--port 0` + P12 端口发现
+- [ ] `tools/` 与 `.github/workflows/` 入库后从零跑一次（当前已入库，需验证一次干净 clone 可用）
 
 ---
 
@@ -1179,7 +1186,7 @@ for i in 1..200:
 
 | # | 未验证项 | 影响 | 关闭时机 |
 |---|---|---|---|
-| U1 | 自建可执行 Node **从未真正构建过** | 主线 | M0 |
+| U1 | ~~自建可执行 Node 从未真正构建过~~ | ✅ **已关闭**：run 42418429182 产出 90MB 可执行文件，`e_entry=0x3898000` + `PT_INTERP` + 16KB 对齐 + 8,724 ICU 符号，SHA256 与仓库一致 | 已关闭 |
 | U2 | `full-icu` 交叉构建时 host toolset 是否置位（**已知必须自己设 `CC_host`**，见 §2.1） | 登录崩 / 构建失败 | M0（CI 门禁③④） |
 | U3 | 16KB 对齐（NDK r28+ 默认；r27 需双 flag） | 装不上/崩 | M0 |
 | U4 | OEM（MIUI/ColorOS）是否额外阻止 exec 提取的 `.so` | 部分设备不可用 | M0 真机 |
@@ -1196,7 +1203,7 @@ for i in 1..200:
 | **U15** | ~~明文凭据存在 `files/data/config.yaml` 里的暴露面~~ | ✅ **已消除**：改用 `SILLYTAVERN_BASICAUTHUSER_*` 环境变量（`util.js:88-95` env 优先），密码不落盘、每次启动轮换 | 已关闭 |
 | **U16** | **ICU 门禁在 CI 里只是 WARN，不是硬失败**（第 5 轮审核实测：该分支无 `exit 1`） | 可能产出"能启动、不能登录"的包 | **M0 前必须改成硬失败** |
 | **U17** | **`tools/` 与 `.github/workflows/` 尚未进入仓库根**（当前 workflow 与脚本在 `.work/ci/`，靠手工拷贝运行） | G4/G5「可复现构建」不成立 | M0 |
-| **U18** | **构建从未完整绿灯一次**（4 个失败已修，但终点未达） | 主线 | M0 |
+| **U18** | ~~构建从未完整绿灯一次~~ | ✅ **已关闭**：run `42418429182` 151.6 分钟、全 13 步 success，产物 90MB | 已关闭 |
 
 ---
 
